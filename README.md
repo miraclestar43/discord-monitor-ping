@@ -3,6 +3,15 @@
 [![tests](https://github.com/runkunl-emr/ping-me-when/actions/workflows/ci.yml/badge.svg)](https://github.com/runkunl-emr/ping-me-when/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+> **Fork notice:** this is a personal fork of
+> [runkunl-emr/ping-me-when](https://github.com/runkunl-emr/ping-me-when)
+> (MIT-licensed). Original credit goes to the upstream author. This fork adds:
+> per-subscription content filters (`require_digit` / `include_any` /
+> `exclude_any` / `regex`, OR-combined with veto), a Linux/Raspberry Pi
+> deployment path via `systemd`, a `User-Agent` header for Discord webhooks,
+> and explicit source attribution (server + channel + author) in forwarded
+> messages.
+
 Get a desktop notification any time a specific person posts in a specific Discord channel.
 
 No coding needed. Double-click to start. Configure everything in your browser.
