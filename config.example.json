@@ -1,0 +1,18 @@
+{
+  "token": "PASTE_YOUR_DISCORD_TOKEN_HERE",
+  "subscriptions": [
+    {
+      "channel_id": "REPLACE_WITH_CHANNEL_ID_TO_WATCH",
+      "usernames": ["username_to_watch"],
+      "label": "optional label",
+      "require_digit": false,
+      "include_any": [],
+      "exclude_any": [],
+      "regex": ""
+    }
+  ],
+  "notify": {
+    "mac": false,
+    "webhook_url": "https://discord.com/api/webhooks/PASTE_URL_HERE"
+  }
+}
