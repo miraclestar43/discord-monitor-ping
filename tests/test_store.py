@@ -18,8 +18,10 @@ def test_save_load_empty(tmp_path: Path):
 def test_save_load_with_subs(tmp_path: Path):
     cfg = store.Config(
         token="t-123",
-        subscriptions=[store.Subscription(channel_id="c1", usernames=["alice", "bob"], label="A")],
-        notify=store.Notify(mac=False, webhook_url="https://x"),
+        profiles=[store.Profile(
+            subscriptions=[store.Subscription(channel_id="c1", usernames=["alice", "bob"], label="A")],
+            notify=store.Notify(mac=False, webhook_url="https://x"),
+        )],
     )
     p = tmp_path / "config.json"
     store.save(cfg, p)
@@ -52,3 +54,15 @@ def test_load_missing_file(tmp_path: Path):
     p = tmp_path / "does-not-exist.json"
     cfg = store.load(p)
     assert cfg.token == ""
+
+
+def test_enabled_defaults_true_and_round_trips(tmp_path: Path):
+    """Configs saved before the enable toggle existed load as enabled."""
+    p = tmp_path / "config.json"
+    p.write_text('{"token": "t", "profiles": [{"name": "A", "subscriptions": '
+                 '[{"channel_id": "c1", "usernames": ["alice"]}]}]}', encoding="utf-8")
+    cfg = store.load(p)
+    assert cfg.subscriptions[0].enabled is True
+    cfg.profiles[0].subscriptions[0].enabled = False
+    store.save(cfg, p)
+    assert store.load(p).subscriptions[0].enabled is False

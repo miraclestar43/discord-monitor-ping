@@ -98,6 +98,9 @@ th {
   letter-spacing: 0.04em;
 }
 td { padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--border-soft); }
+td.sub-toggle { width: 1%; text-align: center; }
+td.sub-toggle input { width: auto; cursor: pointer; }
+tr.sub-disabled td:not(.sub-toggle) { opacity: 0.45; }
 tr:last-child td { border-bottom: none; }
 td input {
   width: 100%; padding: 0.4rem 0.55rem; border: 1px solid transparent; border-radius: 4px;
@@ -161,3 +164,29 @@ details kbd {
 .toast.show { opacity: 1; }
 .toast.bad { color: var(--bad); border-color: var(--bad); }
 .toast.good { color: var(--good); border-color: rgba(35, 165, 90, 0.3); }
+
+.tabs {
+  display: flex; gap: 0.25rem; flex-wrap: wrap;
+  border-bottom: 1px solid var(--border-soft); margin-bottom: 0.9rem;
+}
+.tabs button {
+  background: transparent; color: var(--ink2);
+  border-bottom: 2px solid transparent; border-radius: 4px 4px 0 0;
+  padding: 0.45rem 0.9rem; font-size: 0.88rem;
+}
+.tabs button:hover { color: var(--ink); background: var(--bg-hover); }
+.tabs button.active {
+  color: var(--accent); border-bottom-color: var(--accent); background: var(--accent-soft);
+}
+.tabs button.add-tab {
+  color: var(--ink2); font-weight: 400; padding: 0.45rem 0.7rem;
+}
+.tab-toolbar {
+  display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.8rem;
+}
+.tab-toolbar input.profile-name {
+  flex: 0 1 220px; padding: 0.4rem 0.55rem; border: 1px solid var(--border-soft);
+  border-radius: 4px; font: inherit; font-size: 0.88rem;
+  background: var(--bg-input); color: var(--ink);
+}
+.tab-toolbar input.profile-name:focus { outline: none; border-color: var(--accent); }

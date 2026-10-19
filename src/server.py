@@ -1,8 +1,10 @@
 """HTTP server: serves the SPA + small JSON API for the listener."""
 from __future__ import annotations
 import atexit
+import ipaddress
 import os
 import signal
+import socket
 import urllib.parse
 import webbrowser
 from pathlib import Path
@@ -24,6 +26,32 @@ WEB_DIR = REPO_ROOT / "web"
 # middleware level — defense in depth in case a future change accidentally
 # binds to 0.0.0.0.
 ALLOWED_HOSTS = {"127.0.0.1", "localhost"}
+ALLOWED_CLIENTS = {"127.0.0.1", "::1"}
+
+# Optional remote access over Tailscale, opt-in via env:
+#   PING_TAILSCALE_BIND=<this machine's Tailscale IP>   also listen there
+#   PING_TAILSCALE_CLIENTS=<ip>[,<ip>...]               peers allowed to connect
+# Only Tailscale CGNAT addresses (100.64.0.0/10) are accepted, so this can never
+# expose the page on the LAN or 0.0.0.0. There is no login, so keep the client
+# list to your own devices.
+TAILSCALE_NET = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _tailscale_ips(raw: str) -> list[str]:
+    out = []
+    for part in raw.replace(",", " ").split():
+        try:
+            if ipaddress.ip_address(part) in TAILSCALE_NET:
+                out.append(part)
+        except ValueError:
+            pass
+    return out
+
+
+TAILSCALE_BIND = next(iter(_tailscale_ips(os.environ.get("PING_TAILSCALE_BIND", ""))), "")
+if TAILSCALE_BIND:
+    ALLOWED_HOSTS.add(TAILSCALE_BIND)
+    ALLOWED_CLIENTS.update(_tailscale_ips(os.environ.get("PING_TAILSCALE_CLIENTS", "")))
 
 app = FastAPI(title="ping-me-when", docs_url=None, redoc_url=None)
 
@@ -40,6 +68,9 @@ async def csrf_and_host_guard(request: Request, call_next):
     2. For state-changing methods, require a JSON Content-Type. Stops naive
        cross-origin <form> POSTs (which use application/x-www-form-urlencoded).
     """
+    client = request.client.host if request.client else ""
+    if client not in ALLOWED_CLIENTS:
+        return JSONResponse({"detail": "client not allowed"}, status_code=403)
     host = (request.headers.get("host") or "").split(":")[0].lower()
     if host not in ALLOWED_HOSTS:
         return JSONResponse({"detail": "host not allowed"}, status_code=400)
@@ -54,20 +85,24 @@ async def csrf_and_host_guard(request: Request, call_next):
 
 def _on_hit(h: Hit) -> None:
     cfg = store.load()
-    # Title: prefer user-set label; otherwise show "<author> in #<channel-name>".
-    where = f"#{h.channel_name}" if h.channel_name else f"#{h.channel_id[-6:]}"
-    title = h.sub.label or f"{h.author} in {where}"
-    # Body shows the message plus an explicit "from" source so the forwarded
-    # channel reader knows which server/channel/author it came from.
-    server_part = h.guild_name or (h.guild_id[-6:] if h.guild_id else "DM")
-    source = f"_from **{h.author}** in {where} · {server_part}_"
-    text = h.content.strip() or "(image / embed only)"
-    body = f"{source}\n{text}"
+    # `label` (if set) acts as the channel's display alias; otherwise fall back
+    # to the live channel name, then to a short ID suffix.
+    where = h.sub.label or (f"#{h.channel_name}" if h.channel_name else f"#{h.channel_id[-6:]}")
+    title = f"{h.author} in {where}"
+    body = h.content.strip() or "(image / embed only)"
+    # Route via the profile that matched this hit, falling back to the first
+    # profile if for some reason the name no longer resolves (e.g. renamed mid-run).
+    profile = cfg.profile_by_name(h.profile_name) or (cfg.profiles[0] if cfg.profiles else None)
+    if profile is None:
+        return
+    n = profile.notify
     notify.dispatch(
         title=f"📨 {title}",
         message=body,
-        mac=cfg.notify.mac,
-        webhook_url=cfg.notify.webhook_url or None,
+        mac=n.mac,
+        webhook_url=n.webhook_url or None,
+        telegram_bot_token=n.telegram_bot_token or None,
+        telegram_chat_id=n.telegram_chat_id or None,
         open_url=h.discord_url(),
     )
 
@@ -79,6 +114,7 @@ class SubscriptionIn(BaseModel):
     # 30 usernames per channel is more than enough for any realistic use.
     usernames: list[str] = Field(default_factory=list, max_length=30)
     label: str = Field(default="", max_length=120)
+    enabled: bool = True
     require_digit: bool = False
     include_any: list[str] = Field(default_factory=list, max_length=50)
     exclude_any: list[str] = Field(default_factory=list, max_length=50)
@@ -134,6 +170,8 @@ class SubscriptionIn(BaseModel):
 class NotifyIn(BaseModel):
     mac: bool = True
     webhook_url: str = ""
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
 
     @field_validator("webhook_url")
     @classmethod
@@ -147,18 +185,37 @@ class NotifyIn(BaseModel):
             raise ValueError("invalid URL")
         if parsed.scheme != "https":
             raise ValueError("webhook URL must be https://")
-        # Discord-only — narrow surface, easy to verify.
-        if not (parsed.netloc.endswith(".discord.com") or parsed.netloc == "discord.com"):
+        # Discord-only — narrow surface, easy to verify. Accept both the modern
+        # discord.com and the legacy discordapp.com host that Discord still serves.
+        host = parsed.netloc.lower()
+        allowed = ("discord.com", "discordapp.com")
+        if not (host in allowed or any(host.endswith("." + d) for d in allowed)):
             raise ValueError("only discord.com webhooks are allowed")
+        return v
+
+    @field_validator("telegram_bot_token", "telegram_chat_id")
+    @classmethod
+    def _trim(cls, v: str) -> str:
+        return (v or "").strip()
+
+
+class ProfileIn(BaseModel):
+    name: str = Field(default="Default", max_length=60)
+    # 50 subscriptions per profile keeps the cap roughly where it was overall.
+    subscriptions: list[SubscriptionIn] = Field(default_factory=list, max_length=50)
+    notify: NotifyIn = Field(default_factory=NotifyIn)
+
+    @field_validator("name")
+    @classmethod
+    def _clean_name(cls, v: str) -> str:
+        v = (v or "").strip() or "Default"
         return v
 
 
 class ConfigIn(BaseModel):
     token: str = Field(default="", max_length=200)
-    # 50 subscriptions is plenty for personal use; cap stops accidental DoS
-    # if someone pastes garbage into the API.
-    subscriptions: list[SubscriptionIn] = Field(default_factory=list, max_length=50)
-    notify: NotifyIn = Field(default_factory=NotifyIn)
+    # 20 profiles is plenty; cap stops accidental DoS via the API.
+    profiles: list[ProfileIn] = Field(default_factory=list, max_length=20)
 
 
 @app.get("/api/config")
@@ -166,8 +223,14 @@ def get_config():
     cfg = store.load()
     return {
         "token_set": bool(cfg.token),
-        "subscriptions": [s.__dict__ for s in cfg.subscriptions],
-        "notify": cfg.notify.__dict__,
+        "profiles": [
+            {
+                "name": p.name,
+                "subscriptions": [s.__dict__ for s in p.subscriptions],
+                "notify": p.notify.__dict__,
+            }
+            for p in cfg.profiles
+        ],
     }
 
 
@@ -177,11 +240,24 @@ def post_config(payload: ConfigIn):
     # Empty token in the payload means "don't touch the saved one" — so users
     # don't have to re-paste their token every time they edit subscriptions.
     new_token = payload.token.strip() or existing.token
-    cfg = store.Config(
-        token=new_token,
-        subscriptions=[store.Subscription(**s.model_dump()) for s in payload.subscriptions],
-        notify=store.Notify(**payload.notify.model_dump()),
-    )
+    # Deduplicate profile names so the picker stays unambiguous.
+    seen: dict[str, int] = {}
+    profiles: list[store.Profile] = []
+    for pin in payload.profiles:
+        name = pin.name
+        if name in seen:
+            seen[name] += 1
+            name = f"{name} ({seen[name]})"
+        else:
+            seen[name] = 1
+        profiles.append(store.Profile(
+            name=name,
+            subscriptions=[store.Subscription(**s.model_dump()) for s in pin.subscriptions],
+            notify=store.Notify(**pin.notify.model_dump()),
+        ))
+    if not profiles:
+        profiles = [store.Profile()]
+    cfg = store.Config(token=new_token, profiles=profiles)
     store.save(cfg)
     if _listener:
         _listener.update_config(cfg)
@@ -226,21 +302,36 @@ def status():
                 "timestamp": h.timestamp,
                 "message_id": h.message_id,
                 "url": h.discord_url(),
+                "profile": h.profile_name,
             } for h in reversed(s.hits[-50:])  # newest first, last 50
         ],
     }
 
 
 @app.post("/api/test-notify")
-def test_notify():
+def test_notify(profile: Optional[str] = None):
+    """Send a test notification.
+
+    Without `profile`, fires once per profile so each tab can be verified at
+    once. With `?profile=Name`, targets only that profile.
+    """
     cfg = store.load()
-    res = notify.dispatch(
-        title="ping-me-when test",
-        message="If you see this, notifications are working.",
-        mac=cfg.notify.mac,
-        webhook_url=cfg.notify.webhook_url or None,
-    )
-    return {"ok": True, "result": res}
+    targets = [cfg.profile_by_name(profile)] if profile else cfg.profiles
+    targets = [p for p in targets if p is not None]
+    if not targets:
+        raise HTTPException(404, "profile not found")
+    results = []
+    for p in targets:
+        res = notify.dispatch(
+            title=f"ping-me-when test [{p.name}]",
+            message="If you see this, notifications are working.",
+            mac=p.notify.mac,
+            webhook_url=p.notify.webhook_url or None,
+            telegram_bot_token=p.notify.telegram_bot_token or None,
+            telegram_chat_id=p.notify.telegram_chat_id or None,
+        )
+        results.append({"profile": p.name, **res})
+    return {"ok": True, "results": results}
 
 
 # ---------- static UI ----------
@@ -273,6 +364,15 @@ async def _on_shutdown():
     _shutdown()
 
 
+@app.on_event("startup")
+async def _on_startup():
+    if os.environ.get("PING_AUTOSTART", "") == "1":
+        global _listener
+        if not (_listener and _listener._thread and _listener._thread.is_alive()):
+            _listener = Listener(store.load(), on_hit=_on_hit)
+            _listener.start()
+
+
 def main():
     """Entry point for `python -m src.server`. Opens a browser tab and serves."""
     import uvicorn
@@ -295,7 +395,18 @@ def main():
         except (ValueError, OSError):
             # Can fail if not on the main thread (e.g. inside tests).
             pass
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    if not TAILSCALE_BIND:
+        uvicorn.run(app, host=host, port=port, log_level="info")
+        return
+    # Serve on loopback and the Tailscale address at once (uvicorn binds one host,
+    # so hand it pre-bound sockets).
+    sockets = []
+    for addr in (host, TAILSCALE_BIND):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((addr, port))
+        sockets.append(s)
+    uvicorn.Server(uvicorn.Config(app, log_level="info")).run(sockets=sockets)
 
 
 if __name__ == "__main__":

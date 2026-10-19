@@ -105,8 +105,36 @@ def webhook_send(url: str, content: str) -> bool:
         return False
 
 
+def telegram_send(bot_token: str, chat_id: str, text: str) -> bool:
+    """Send a message via Telegram Bot API (sendMessage)."""
+    if not bot_token or not chat_id:
+        return False
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps({
+                "chat_id": chat_id,
+                "text": text[:4000],
+                "disable_web_page_preview": True,
+            }).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "ping-me-when/1.0",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+        return True
+    except Exception as e:
+        print(f"[notify/telegram] failed: {e}")
+        return False
+
+
 def dispatch(*, title: str, message: str,
              mac: bool = True, webhook_url: Optional[str] = None,
+             telegram_bot_token: Optional[str] = None,
+             telegram_chat_id: Optional[str] = None,
              open_url: Optional[str] = None) -> dict:
     """Send notification through every enabled channel.
 
@@ -128,4 +156,9 @@ def dispatch(*, title: str, message: str,
         if open_url:
             body += f"\n{open_url}"
         results["webhook"] = webhook_send(webhook_url, body)
+    if telegram_bot_token and telegram_chat_id:
+        body = f"{title}\n{message}"
+        if open_url:
+            body += f"\n{open_url}"
+        results["telegram"] = telegram_send(telegram_bot_token, telegram_chat_id, body)
     return results

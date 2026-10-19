@@ -68,6 +68,9 @@ def _passes_filters(sub: Subscription, content: str) -> bool:
 
 
 GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json"
+# Gateway close codes where reconnecting can't succeed: 4004 auth failed,
+# 4010-4014 invalid shard / sharding required / invalid or disallowed intents.
+FATAL_CLOSE_CODES = {4004, 4010, 4011, 4012, 4013, 4014}
 INTENT_GUILD_MESSAGES = 1 << 9
 INTENT_MESSAGE_CONTENT = 1 << 15  # only relevant if you ever switch to bot tokens
 DEFAULT_INTENTS = INTENT_GUILD_MESSAGES | INTENT_MESSAGE_CONTENT
@@ -85,6 +88,7 @@ class Hit:
     channel_name: str = ""  # populated from GUILD_CREATE if known
     guild_id: str = ""
     guild_name: str = ""  # populated from GUILD_CREATE if known
+    profile_name: str = ""  # which profile (tab) matched this message
 
     def discord_url(self) -> str:
         if self.guild_id:
@@ -116,6 +120,8 @@ class Listener:
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_interval_ms = 41250
         self._last_seq: Optional[int] = None
+        self._heartbeat_acked = True
+        self._backoff = 1
         self._stop = threading.Event()
         # channel_id -> {"name": str, "guild_id": str}
         # Populated lazily from GUILD_CREATE events.
@@ -130,7 +136,7 @@ class Listener:
         token = (self.cfg.token or "").strip()
         if len(token) < 30:
             raise ValueError("token looks invalid (too short)")
-        if not self.cfg.subscriptions:
+        if not any(p.subscriptions for p in self.cfg.profiles):
             raise ValueError("no subscriptions configured")
         # Reset the stop flag — important for restarts after INVALID_SESSION.
         self._stop = threading.Event()
@@ -161,8 +167,9 @@ class Listener:
     # ---- internals ----
 
     def _run(self) -> None:
-        # Outer loop: reconnect on any disconnection until the user explicitly stops.
-        backoff = 1
+        # Outer loop: reconnect on any disconnection until the user explicitly stops
+        # or Discord closes with a fatal code (see FATAL_CLOSE_CODES).
+        self._backoff = 1
         while not self._stop.is_set():
             try:
                 self._ws = websocket.WebSocketApp(
@@ -183,9 +190,10 @@ class Listener:
             # accumulate one per reconnect attempt.
             if self._heartbeat_thread and self._heartbeat_thread.is_alive():
                 self._heartbeat_thread.join(timeout=2)
-            # Reconnect backoff: 1, 2, 4, 8, 16, max 60.
-            time.sleep(min(backoff, 60))
-            backoff = min(backoff * 2, 60)
+            # Reconnect backoff: 1, 2, 4, 8, 16, max 60. Reset on READY.
+            # Interruptible so stop() doesn't have to wait out a long sleep.
+            self._stop.wait(min(self._backoff, 60))
+            self._backoff = min(self._backoff * 2, 60)
 
     def _on_open(self, _ws):
         self.status.connected = True
@@ -193,11 +201,26 @@ class Listener:
 
     def _on_close(self, _ws, code, reason):
         self.status.connected = False
-        if reason:
-            self.status.last_error = f"closed: {code} {reason}"
+        if code or reason:
+            self._handle_close_code(code, reason)
 
     def _on_error(self, _ws, err):
+        # websocket-client hands a server close frame to on_error (and then calls
+        # on_close without the code), so decode the close code from the frame here.
+        if isinstance(err, websocket.ABNF):
+            if err.opcode == websocket.ABNF.OPCODE_CLOSE and len(err.data) >= 2:
+                code = int.from_bytes(err.data[:2], "big")
+                self._handle_close_code(code, err.data[2:].decode("utf-8", "replace"))
+            return
         self.status.last_error = f"error: {err}"
+
+    def _handle_close_code(self, code, reason) -> None:
+        # Keep a more specific message (e.g. "invalid session") over a plain normal close.
+        if code != 1000 or not self.status.last_error:
+            self.status.last_error = f"closed: {code} {reason or ''}".strip()
+        if code in FATAL_CLOSE_CODES:
+            # Bad token / bad intents: retrying can't help, stop until the user fixes config.
+            self._stop.set()
 
     def _on_message(self, ws, raw):
         try:
@@ -218,14 +241,21 @@ class Listener:
             if t == "MESSAGE_CREATE":
                 self._handle_message(payload["d"])
             elif t in ("GUILD_CREATE", "GUILD_UPDATE", "READY"):
+                if t == "READY":
+                    self._backoff = 1
                 self._learn_channel_names(payload["d"])
             elif t in ("CHANNEL_CREATE", "CHANNEL_UPDATE"):
                 self._learn_one_channel(payload["d"])
-        elif op == 11:  # HEARTBEAT_ACK — silent
-            pass
-        elif op == 9:  # INVALID_SESSION — token bad, don't auto-retry tightly
-            self.status.last_error = "invalid session — check token"
-            self._stop.set()
+        elif op == 11:  # HEARTBEAT_ACK
+            self._heartbeat_acked = True
+        elif op == 7:  # RECONNECT — Discord asks us to drop and reconnect
+            ws.close()
+        elif op == 9:
+            # INVALID_SESSION is routine (expired session, identify rate limit,
+            # e.g. right after a network outage) — reconnect via the backoff loop.
+            # A genuinely bad token gets close code 4004 instead (FATAL_CLOSE_CODES).
+            self.status.last_error = "invalid session — reconnecting"
+            ws.close()
 
     def _learn_channel_names(self, data: dict) -> None:
         """Cache channel id -> {name, guild_id, guild_name} from a GUILD_CREATE-shaped payload."""
@@ -266,9 +296,21 @@ class Listener:
     def _start_heartbeat(self, ws):
         if self._heartbeat_thread and self._heartbeat_thread.is_alive():
             return
+        self._heartbeat_acked = True
+
         def beat():
             interval = self._heartbeat_interval_ms / 1000.0
             while not self._stop.is_set() and self.status.connected:
+                if not self._heartbeat_acked:
+                    # No ACK since the last beat: zombie connection (e.g. the
+                    # network dropped without a TCP close). Force a reconnect.
+                    self.status.last_error = "heartbeat not acknowledged — reconnecting"
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    return
+                self._heartbeat_acked = False
                 try:
                     ws.send(json.dumps({"op": 1, "d": self._last_seq}))
                 except Exception:
@@ -281,36 +323,40 @@ class Listener:
         channel_id = str(msg.get("channel_id", ""))
         author = msg.get("author", {}) or {}
         author_name = (author.get("username") or "").lower()
-        if not channel_id or not author_name:
+        author_id = str(author.get("id", "") or "")
+        if not channel_id or not (author_name or author_id):
             return
 
         meta = self._channel_meta.get(channel_id, {})
-        for sub in self.cfg.subscriptions:
-            if sub.channel_id != channel_id:
-                continue
-            allowed = {u.lower() for u in (sub.usernames or []) if u}
-            if author_name not in allowed:
-                continue
-            content = msg.get("content", "") or ""
-            if not _passes_filters(sub, content):
-                continue
-            hit = Hit(
-                sub=sub,
-                author=author.get("username", ""),
-                content=content,
-                message_id=str(msg.get("id", "")),
-                channel_id=channel_id,
-                timestamp=msg.get("timestamp", ""),
-                channel_name=meta.get("name", ""),
-                guild_id=meta.get("guild_id", ""),
-                guild_name=meta.get("guild_name", ""),
-            )
-            self.status.last_hit = hit
-            self.status.hits.append(hit)
-            if len(self.status.hits) > self.MAX_HISTORY:
-                self.status.hits = self.status.hits[-self.MAX_HISTORY:]
-            try:
-                self.on_hit(hit)
-            except Exception as e:
-                self.status.last_error = f"on_hit: {e}"
-            break  # one match per message is enough
+        for profile in self.cfg.profiles:
+            for sub in profile.subscriptions:
+                if not getattr(sub, "enabled", True) or sub.channel_id != channel_id:
+                    continue
+                allowed_names = {u.lower() for u in (sub.usernames or []) if u and not str(u).isdigit()}
+                allowed_ids = {str(u) for u in (sub.usernames or []) if str(u).isdigit()}
+                if author_name not in allowed_names and author_id not in allowed_ids:
+                    continue
+                content = msg.get("content", "") or ""
+                if not _passes_filters(sub, content):
+                    continue
+                hit = Hit(
+                    sub=sub,
+                    author=author.get("username", ""),
+                    content=content,
+                    message_id=str(msg.get("id", "")),
+                    channel_id=channel_id,
+                    timestamp=msg.get("timestamp", ""),
+                    channel_name=meta.get("name", ""),
+                    guild_id=meta.get("guild_id", ""),
+                    guild_name=meta.get("guild_name", ""),
+                    profile_name=profile.name,
+                )
+                self.status.last_hit = hit
+                self.status.hits.append(hit)
+                if len(self.status.hits) > self.MAX_HISTORY:
+                    self.status.hits = self.status.hits[-self.MAX_HISTORY:]
+                try:
+                    self.on_hit(hit)
+                except Exception as e:
+                    self.status.last_error = f"on_hit: {e}"
+                return  # one match per message is enough, even across profiles

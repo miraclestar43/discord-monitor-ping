@@ -38,10 +38,20 @@
   </section>
 
   <section>
-    <h2 data-i18n="subs_h">What to listen for</h2>
+    <h2 data-i18n="profiles_h">Profiles</h2>
+    <p class="hint" data-i18n="profiles_hint">Each tab is an independent group — its own channels and its own notification destinations. Use this to split categories (e.g. trading vs. social).</p>
+    <div class="tabs" id="tabs"></div>
+
+    <div class="tab-toolbar">
+      <input class="profile-name" id="profile-name" placeholder="Profile name">
+      <button id="delete-profile" class="danger" data-i18n="delete_profile">Delete profile</button>
+    </div>
+
+    <h3 data-i18n="subs_h">What to listen for</h3>
     <p class="hint" data-i18n="subs_hint">You'll get a notification any time any of the listed users post in the listed channel. Separate multiple usernames with commas or spaces.</p>
     <table id="subs-table">
       <thead><tr>
+        <th data-i18n="th_enabled">On</th>
         <th data-i18n="th_channel">Channel ID</th>
         <th data-i18n="th_users">Usernames (comma- or space-separated)</th>
         <th data-i18n="th_label">Label (optional)</th>
@@ -55,10 +65,19 @@
 
   <section>
     <h2 data-i18n="notify_h">Notifications</h2>
+    <p class="hint" id="notify-for"></p>
     <label><input type="checkbox" id="n-mac" checked> <span data-i18n="notify_mac">macOS desktop notification</span></label>
     <label class="stack">
       <span data-i18n="notify_webhook">Discord webhook URL (optional)</span>
       <input type="text" id="n-webhook" placeholder="https://discord.com/api/webhooks/...">
+    </label>
+    <label class="stack">
+      <span data-i18n="notify_tg_token">Telegram bot token (optional)</span>
+      <input type="text" id="n-tg-token" placeholder="123456789:ABC...">
+    </label>
+    <label class="stack">
+      <span data-i18n="notify_tg_chat">Telegram chat ID (optional)</span>
+      <input type="text" id="n-tg-chat" placeholder="numeric chat id">
     </label>
     <button id="test-notify" class="ghost" data-i18n="notify_test">Send test notification</button>
   </section>

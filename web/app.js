@@ -7,12 +7,19 @@ const I18N = {
     token_hint: 'Your token never leaves this machine. It\'s stored in <code>config.json</code> next to the app.',
     token_help: "How do I get my token?",
     token_warn: "Treat your token like a password. Anyone with it can read every channel you can see.",
+    profiles_h: "Profiles",
+    profiles_hint: "Each tab is an independent group — its own channels and its own notification destinations. Use this to split categories (e.g. trading vs. social).",
+    add_profile: "+ New profile",
+    delete_profile: "Delete profile",
+    confirm_delete_profile: "Delete this profile and all its subscriptions?",
     subs_h: "What to listen for",
     subs_hint: "You'll get a notification any time any of the listed users post in the listed channel. Separate multiple usernames with commas or spaces.",
     th_channel: "Channel ID",
     th_users: "Usernames (comma- or space-separated)",
     th_label: "Label (optional)",
     th_filter: "Filter",
+    th_enabled: "On",
+    enabled_title: "Uncheck to pause this subscription without deleting it",
     filter_summary: "Advanced filter (any-match)",
     filter_digit: "Message contains a digit (0-9)",
     filter_include: "Includes any of these words (comma-separated)",
@@ -21,8 +28,11 @@ const I18N = {
     filter_active: "filter active",
     add_sub: "+ Add subscription",
     notify_h: "Notifications",
+    notify_for: "(for this profile)",
     notify_mac: "macOS desktop notification",
     notify_webhook: "Discord webhook URL (optional)",
+    notify_tg_token: "Telegram bot token (optional)",
+    notify_tg_chat: "Telegram chat ID (optional)",
     notify_test: "Send test notification",
     btn_save: "Save", btn_start: "Start listening", btn_stop: "Stop",
     hits_h: "Recent hits",
@@ -37,12 +47,19 @@ const I18N = {
     token_hint: '令牌只保存在你的电脑上，写到应用同目录的 <code>config.json</code> 里。',
     token_help: "怎么获取我的 token？",
     token_warn: "把令牌当密码看待。任何拿到它的人都能读取你能看到的所有频道。",
+    profiles_h: "分组",
+    profiles_hint: "每个标签页是一个独立分组 — 各自的频道、各自的通知目的地。可用来分类（比如「交易」和「日常」）。",
+    add_profile: "+ 新建分组",
+    delete_profile: "删除当前分组",
+    confirm_delete_profile: "确认删除这个分组及其所有订阅？",
     subs_h: "监听什么",
     subs_hint: "列表里的任何一个用户在指定频道发言时都会推送通知。多个用户名用逗号或空格分隔。",
     th_channel: "频道 ID",
     th_users: "用户名（逗号或空格分隔）",
     th_label: "备注（可选）",
     th_filter: "过滤",
+    th_enabled: "启用",
+    enabled_title: "取消勾选可暂停此订阅，不会删除",
     filter_summary: "高级过滤（任一匹配即通知）",
     filter_digit: "消息包含数字（0-9）",
     filter_include: "包含以下任一词（逗号分隔）",
@@ -51,8 +68,11 @@ const I18N = {
     filter_active: "过滤已启用",
     add_sub: "+ 添加订阅",
     notify_h: "通知方式",
+    notify_for: "（当前分组）",
     notify_mac: "macOS 桌面通知",
     notify_webhook: "Discord webhook URL（可选）",
+    notify_tg_token: "Telegram bot token（可选）",
+    notify_tg_chat: "Telegram chat ID（可选）",
     notify_test: "发送测试通知",
     btn_save: "保存", btn_start: "开始监听", btn_stop: "停止",
     hits_h: "最近收到",
@@ -72,7 +92,22 @@ function applyI18n() {
 }
 
 // ------- state -------
-let state = { token: "", subs: [], notify: { mac: true, webhook_url: "" } };
+// profiles: [{ name, subscriptions: [...], notify: {...} }, ...]
+let state = { token: "", profiles: [], active: 0 };
+
+function newSub() {
+  return { channel_id: "", usernames: [], label: "", enabled: true,
+           require_digit: false, include_any: [], exclude_any: [], regex: "" };
+}
+function newProfile(name) {
+  return { name: name || "Default", subscriptions: [newSub()],
+           notify: { mac: false, webhook_url: "", telegram_bot_token: "", telegram_chat_id: "" } };
+}
+function activeProfile() {
+  if (!state.profiles.length) state.profiles.push(newProfile());
+  if (state.active < 0 || state.active >= state.profiles.length) state.active = 0;
+  return state.profiles[state.active];
+}
 
 async function api(path, body) {
   const opts = { method: body !== undefined ? "POST" : "GET", headers: { "Content-Type": "application/json" } };
@@ -98,13 +133,34 @@ function toast(msg, kind = "good") {
 function escapeAttr(s) { return String(s).replace(/"/g, "&quot;"); }
 function escapeHtml(s) { return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
 
+function renderTabs() {
+  const bar = $("tabs");
+  bar.innerHTML = state.profiles.map((p, i) =>
+    `<button data-tab="${i}"${i === state.active ? ' class="active"' : ''}>${escapeHtml(p.name || "Default")}</button>`
+  ).join("") + `<button class="add-tab" id="add-profile">${escapeHtml(t("add_profile"))}</button>`;
+  bar.querySelectorAll("button[data-tab]").forEach(b => {
+    b.addEventListener("click", e => {
+      state.active = +e.target.dataset.tab;
+      renderAll();
+    });
+  });
+  $("add-profile").addEventListener("click", () => {
+    state.profiles.push(newProfile(`Profile ${state.profiles.length + 1}`));
+    state.active = state.profiles.length - 1;
+    renderAll();
+  });
+}
+
 function renderSubs() {
+  const p = activeProfile();
   const tbody = $("subs-body");
-  tbody.innerHTML = state.subs.map((s, i) => {
+  tbody.innerHTML = p.subscriptions.map((s, i) => {
     const active = !!(s.require_digit || (s.include_any || []).length || (s.exclude_any || []).length || s.regex);
     const badge = active ? ` <span class="label-tag">${escapeHtml(t("filter_active"))}</span>` : "";
+    const on = s.enabled !== false;
     return `
-    <tr>
+    <tr${on ? "" : ' class="sub-disabled"'}>
+      <td class="sub-toggle"><input type="checkbox" data-i="${i}" data-k="enabled" ${on ? "checked" : ""} title="${escapeAttr(t("enabled_title"))}"></td>
       <td><input data-i="${i}" data-k="channel_id" value="${escapeAttr(s.channel_id || "")}" placeholder="123…"></td>
       <td><input data-i="${i}" data-k="usernames" value="${escapeAttr((s.usernames || []).join(", "))}" placeholder="alice, bob"></td>
       <td><input data-i="${i}" data-k="label" value="${escapeAttr(s.label || "")}" placeholder=""></td>
@@ -136,49 +192,93 @@ function renderSubs() {
     const evt = inp.type === "checkbox" ? "change" : "input";
     inp.addEventListener(evt, e => {
       const i = +e.target.dataset.i, k = e.target.dataset.k;
+      const sub = activeProfile().subscriptions[i];
       if (k === "usernames" || k === "include_any" || k === "exclude_any") {
-        state.subs[i][k] = e.target.value.split(/[\s,]+/).map(x => x.trim()).filter(Boolean);
+        sub[k] = e.target.value.split(/[\s,]+/).map(x => x.trim()).filter(Boolean);
       } else if (k === "require_digit") {
-        state.subs[i][k] = e.target.checked;
+        sub[k] = e.target.checked;
+      } else if (k === "enabled") {
+        sub[k] = e.target.checked;
+        e.target.closest("tr").classList.toggle("sub-disabled", !sub[k]);
       } else {
-        state.subs[i][k] = e.target.value.trim();
+        sub[k] = e.target.value.trim();
       }
     });
   });
   tbody.querySelectorAll("button[data-del]").forEach(b => {
     b.addEventListener("click", e => {
-      state.subs.splice(+e.target.dataset.del, 1);
+      activeProfile().subscriptions.splice(+e.target.dataset.del, 1);
+      if (!activeProfile().subscriptions.length) activeProfile().subscriptions.push(newSub());
       renderSubs();
     });
   });
 }
 
+function renderNotify() {
+  const p = activeProfile();
+  $("profile-name").value = p.name || "";
+  $("n-mac").checked = !!p.notify.mac;
+  $("n-webhook").value = p.notify.webhook_url || "";
+  $("n-tg-token").value = p.notify.telegram_bot_token || "";
+  $("n-tg-chat").value = p.notify.telegram_chat_id || "";
+  $("notify-for").textContent = `${t("notify_for")} ${p.name || ""}`.trim();
+}
+
+function readNotifyFromUi() {
+  const p = activeProfile();
+  p.name = ($("profile-name").value.trim() || "Default");
+  p.notify = {
+    mac: $("n-mac").checked,
+    webhook_url: $("n-webhook").value.trim(),
+    telegram_bot_token: $("n-tg-token").value.trim(),
+    telegram_chat_id: $("n-tg-chat").value.trim(),
+  };
+}
+
+function renderAll() {
+  renderTabs();
+  renderSubs();
+  renderNotify();
+  applyI18n();
+}
+
 async function load() {
   const c = await api("/api/config");
-  state.subs = c.subscriptions.length
-    ? c.subscriptions.map(s => ({
-        channel_id: s.channel_id || "",
-        usernames: s.usernames || (s.username ? [s.username] : []),
-        label: s.label || "",
-        require_digit: !!s.require_digit,
-        include_any: s.include_any || [],
-        exclude_any: s.exclude_any || [],
-        regex: s.regex || "",
-      }))
-    : [{ channel_id: "", usernames: [], label: "",
-         require_digit: false, include_any: [], exclude_any: [], regex: "" }];
-  state.notify = c.notify;
+  state.profiles = (c.profiles || []).map(p => ({
+    name: p.name || "Default",
+    subscriptions: (p.subscriptions || []).map(s => ({
+      channel_id: s.channel_id || "",
+      usernames: s.usernames || (s.username ? [s.username] : []),
+      label: s.label || "",
+      enabled: s.enabled !== false,
+      require_digit: !!s.require_digit,
+      include_any: s.include_any || [],
+      exclude_any: s.exclude_any || [],
+      regex: s.regex || "",
+    })),
+    notify: {
+      mac: !!(p.notify && p.notify.mac),
+      webhook_url: (p.notify && p.notify.webhook_url) || "",
+      telegram_bot_token: (p.notify && p.notify.telegram_bot_token) || "",
+      telegram_chat_id: (p.notify && p.notify.telegram_chat_id) || "",
+    },
+  }));
+  if (!state.profiles.length) state.profiles = [newProfile()];
+  for (const p of state.profiles) if (!p.subscriptions.length) p.subscriptions.push(newSub());
+  if (state.active >= state.profiles.length) state.active = 0;
   $("token").placeholder = c.token_set ? "(token saved — paste again to replace)" : t("token_h");
-  $("n-mac").checked = !!c.notify.mac;
-  $("n-webhook").value = c.notify.webhook_url || "";
-  renderSubs();
+  renderAll();
 }
 
 async function save() {
+  readNotifyFromUi();
   const payload = {
     token: $("token").value.trim(),  // empty = keep existing
-    subscriptions: state.subs.filter(s => s.channel_id && (s.usernames || []).length),
-    notify: { mac: $("n-mac").checked, webhook_url: $("n-webhook").value.trim() },
+    profiles: state.profiles.map(p => ({
+      name: p.name || "Default",
+      subscriptions: p.subscriptions.filter(s => s.channel_id && (s.usernames || []).length),
+      notify: p.notify,
+    })),
   };
   try {
     await api("/api/config", payload);
@@ -209,12 +309,14 @@ async function refreshStatus() {
     $("hits").innerHTML = s.hits.map(h => {
       const labelTag = (h.label && h.label !== h.author)
         ? `<span class="label-tag">${escapeHtml(h.label)}</span>` : "";
+      const profileTag = h.profile
+        ? `<span class="label-tag" style="background:var(--bg-input);color:var(--ink2);">${escapeHtml(h.profile)}</span>` : "";
       const body = h.content ? escapeHtml(h.content) : `<em style='color:var(--muted)'>${escapeHtml(t("image_only"))}</em>`;
       const ts = escapeHtml((h.timestamp || "").replace("T", " ").slice(0, 16));
       const where = h.channel_name ? `#${escapeHtml(h.channel_name)}` : `channel ${escapeHtml(h.channel_id)}`;
       const link = h.url ? `<a href="${escapeAttr(h.url)}" target="_blank" rel="noopener" style="color:var(--accent2);">↗</a>` : "";
       return `<li>
-        <div>${labelTag}<span class="author">${escapeHtml(h.author)}</span>: <span class="content">${body}</span></div>
+        <div>${profileTag}${labelTag}<span class="author">${escapeHtml(h.author)}</span>: <span class="content">${body}</span></div>
         <div class="hit-meta">${ts} · ${where} ${link}</div>
       </li>`;
     }).join("") || `<li class='hint'>${escapeHtml(t("nothing"))}</li>`;
@@ -228,9 +330,25 @@ $("lang").addEventListener("change", e => {
   applyI18n(); load(); refreshStatus();
 });
 $("add-sub").addEventListener("click", () => {
-  state.subs.push({ channel_id: "", usernames: [], label: "",
-                    require_digit: false, include_any: [], exclude_any: [], regex: "" });
+  activeProfile().subscriptions.push(newSub());
   renderSubs();
+});
+$("delete-profile").addEventListener("click", () => {
+  if (state.profiles.length <= 1) {
+    toast(t("delete_profile") + ": ≥1", "bad"); return;
+  }
+  if (!confirm(t("confirm_delete_profile"))) return;
+  state.profiles.splice(state.active, 1);
+  state.active = Math.max(0, state.active - 1);
+  renderAll();
+});
+$("profile-name").addEventListener("input", () => {
+  activeProfile().name = $("profile-name").value.trim() || "Default";
+  renderTabs();
+});
+["n-mac", "n-webhook", "n-tg-token", "n-tg-chat"].forEach(id => {
+  $(id).addEventListener("input", () => readNotifyFromUi());
+  $(id).addEventListener("change", () => readNotifyFromUi());
 });
 $("save").addEventListener("click", save);
 $("start").addEventListener("click", async () => {
@@ -243,7 +361,8 @@ $("stop").addEventListener("click", async () => {
 });
 $("test-notify").addEventListener("click", async () => {
   if (!await save()) return;
-  await api("/api/test-notify", {});
+  const p = activeProfile();
+  await api("/api/test-notify?profile=" + encodeURIComponent(p.name), {});
   toast(t("test_sent"));
 });
 

@@ -1,11 +1,11 @@
 """Listener filtering logic — the part that decides which Discord messages
 trigger a notification. Doesn't connect to a real socket."""
 from src.listener import Listener
-from src.store import Config, Subscription
+from src.store import Config, Profile, Subscription
 
 
 def make_listener(subs):
-    cfg = Config(token="t" * 40, subscriptions=subs)
+    cfg = Config(token="t" * 40, profiles=[Profile(subscriptions=subs)])
     hits = []
     L = Listener(cfg, on_hit=lambda h: hits.append(h))
     return L, hits
@@ -83,3 +83,10 @@ def test_legacy_username_field_migrates():
     s = Subscription._from_legacy({"channel_id": "c1", "username": "alice", "label": "A"})
     assert s.usernames == ["alice"]
     assert s.label == "A"
+
+
+def test_disabled_subscription_is_skipped():
+    """An unchecked (paused) subscription stays in config but never fires."""
+    L, hits = make_listener([Subscription(channel_id="c1", usernames=["alice"], enabled=False)])
+    L._handle_message(msg())
+    assert hits == []
